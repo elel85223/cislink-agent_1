@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CISLink Agent v2.1 - Синхронизация данных дистрибьюторов
-С исправленным парсингом ошибок и обработкой stale elements
+CISLink Agent v2.2 - Синхронизация данных дистрибьюторов
+С исправленным парсингом ошибок и правильными селекторами
 """
 
 import os
@@ -74,20 +74,20 @@ class CISLinkAgent:
         self.driver.get(f"{CISLINK_URL}/Account/Login.aspx")
         time.sleep(2)
         
-        # Ввод логина
+        # Ввод логина - правильный селектор
         login_field = self.wait.until(
-            EC.presence_of_element_located((By.ID, "MainContent_LoginUser_UserName"))
+            EC.presence_of_element_located((By.ID, "txtLogin"))
         )
         login_field.clear()
         login_field.send_keys(CISLINK_LOGIN)
         
-        # Ввод пароля
-        password_field = self.driver.find_element(By.ID, "MainContent_LoginUser_Password")
+        # Ввод пароля - правильный селектор
+        password_field = self.driver.find_element(By.ID, "txtPassword")
         password_field.clear()
         password_field.send_keys(CISLINK_PASSWORD)
         
-        # Клик на кнопку входа
-        login_button = self.driver.find_element(By.ID, "MainContent_LoginUser_LoginButton")
+        # Клик на кнопку входа - правильный селектор
+        login_button = self.driver.find_element(By.ID, "btnEnter")
         login_button.click()
         
         time.sleep(3)
@@ -158,9 +158,11 @@ class CISLinkAgent:
                 try:
                     links = row.find_elements(By.TAG_NAME, "a")
                     for link in links:
-                        if "Error" in link.text or "lnkView" in link.get_attribute("id") or "":
+                        link_id_attr = link.get_attribute("id") or ""
+                        link_text = link.text or ""
+                        if "Error" in link_text or "lnkView" in link_id_attr:
                             error_link = link
-                            logger.info("Найдена ссылка Error по тексту")
+                            logger.info("Найдена ссылка Error по тексту/атрибуту")
                             break
                 except:
                     pass
@@ -172,76 +174,50 @@ class CISLinkAgent:
             # Кликаем на ссылку Error
             logger.info("Кликаем на ссылку Error...")
             try:
-                # Скроллим к элементу
                 self.driver.execute_script("arguments[0].scrollIntoView(true);", error_link)
                 time.sleep(0.5)
-                
-                # Пробуем обычный клик
                 error_link.click()
             except ElementClickInterceptedException:
-                # Если не получилось, используем JavaScript
                 self.driver.execute_script("arguments[0].click();", error_link)
             
             # Ждем появления popup с деталями
             time.sleep(2)
             
-            # Ищем элемент с текстом ошибки разными способами
+            # Ищем элемент с текстом ошибки
             error_text = ""
             error_html = ""
             
-            # Способ 1: по ID
-            selectors = [
-                "ctl00_ContentPlaceHolder1_lblDetails",
-                "lblDetails",
-                "ContentPlaceHolder1_lblDetails"
-            ]
+            # Способ 1: по ID lblDetails
+            try:
+                element = self.driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblDetails")
+                error_text = element.text
+                error_html = element.get_attribute("innerHTML")
+                logger.info(f"Найден текст ошибки по ID lblDetails")
+            except NoSuchElementException:
+                pass
             
-            for selector in selectors:
-                try:
-                    element = self.driver.find_element(By.ID, selector)
-                    error_text = element.text
-                    error_html = element.get_attribute("innerHTML")
-                    if error_text:
-                        logger.info(f"Найден текст ошибки по ID {selector}")
-                        break
-                except NoSuchElementException:
-                    continue
-            
-            # Способ 2: по CSS селекторам
+            # Способ 2: поиск span внутри popup
             if not error_text:
-                css_selectors = [
-                    ".pnlBackGround span",
-                    ".pnlBackGround div",
-                    "[id*='lblDetails']",
-                    "[id*='Details']",
-                    ".modal-body",
-                    ".popup-content"
-                ]
-                
-                for css in css_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.CSS_SELECTOR, css)
-                        for el in elements:
-                            text = el.text.strip()
-                            if text and len(text) > 20 and ("Шаг" in text or "найден" in text or "ошибк" in text.lower()):
-                                error_text = text
-                                error_html = el.get_attribute("innerHTML")
-                                logger.info(f"Найден текст ошибки по CSS: {css}")
-                                break
-                        if error_text:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, "span[id*='lblDetails']")
+                    for el in elements:
+                        text = el.text.strip()
+                        if text and len(text) > 10:
+                            error_text = text
+                            error_html = el.get_attribute("innerHTML")
+                            logger.info("Найден текст ошибки по CSS span[id*='lblDetails']")
                             break
-                    except:
-                        continue
+                except:
+                    pass
             
-            # Способ 3: поиск по XPath
+            # Способ 3: поиск по содержимому
             if not error_text:
                 try:
-                    # Ищем любой элемент с текстом про шаг или ошибку
-                    xpath = "//*[contains(text(), 'Шаг') or contains(text(), 'найден') or contains(text(), 'ошибк')]"
+                    xpath = "//*[contains(text(), 'Шаг') and contains(text(), 'найден')]"
                     elements = self.driver.find_elements(By.XPATH, xpath)
                     for el in elements:
                         text = el.text.strip()
-                        if len(text) > 50:
+                        if len(text) > 30:
                             error_text = text
                             error_html = el.get_attribute("innerHTML")
                             logger.info("Найден текст ошибки по XPath")
@@ -249,28 +225,22 @@ class CISLinkAgent:
                 except:
                     pass
             
-            # Способ 4: получить весь HTML popup и извлечь текст
+            # Способ 4: получить текст из pnlBackGround
             if not error_text:
                 try:
-                    popup_selectors = [".pnlBackGround", "[class*='popup']", "[class*='modal']", "[id*='pnl']"]
-                    for sel in popup_selectors:
-                        try:
-                            popup = self.driver.find_element(By.CSS_SELECTOR, sel)
-                            full_text = popup.text
-                            if "Шаг" in full_text or "найден" in full_text:
-                                error_text = full_text
-                                error_html = popup.get_attribute("innerHTML")
-                                logger.info(f"Найден текст ошибки в popup: {sel}")
-                                break
-                        except:
-                            continue
+                    popup = self.driver.find_element(By.CSS_SELECTOR, ".pnlBackGround")
+                    full_text = popup.text
+                    if "Шаг" in full_text or "найден" in full_text:
+                        error_text = full_text
+                        error_html = popup.get_attribute("innerHTML")
+                        logger.info("Найден текст ошибки в pnlBackGround")
                 except:
                     pass
             
             logger.info(f"Получен текст ошибки ({len(error_text)} символов)")
             
             if error_text:
-                logger.info(f"Первые 200 символов: {error_text[:200]}")
+                logger.info(f"Первые 300 символов: {error_text[:300]}")
             
             # Закрываем popup
             self._close_popup()
@@ -283,7 +253,6 @@ class CISLinkAgent:
             
         except Exception as e:
             logger.error(f"Ошибка при парсинге деталей: {e}")
-            # Пытаемся закрыть popup в любом случае
             try:
                 self._close_popup()
             except:
@@ -294,25 +263,22 @@ class CISLinkAgent:
         """Закрытие popup окна"""
         try:
             # Способ 1: кнопка Закрыть
-            close_buttons = self.driver.find_elements(By.CSS_SELECTOR, "input[value='Закрыть'], input[value='Close'], button.close, .btn-close")
-            for btn in close_buttons:
+            close_selectors = [
+                "input[value='Закрыть']",
+                "input[value='Close']",
+                "button.close",
+                ".btn-close"
+            ]
+            for sel in close_selectors:
                 try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
                     btn.click()
                     time.sleep(0.5)
                     return
                 except:
                     continue
             
-            # Способ 2: клик вне popup
-            try:
-                overlay = self.driver.find_element(By.CSS_SELECTOR, ".modal-backdrop, .overlay, .pnlBackGround")
-                self.driver.execute_script("arguments[0].click();", overlay)
-                time.sleep(0.5)
-                return
-            except:
-                pass
-            
-            # Способ 3: Escape
+            # Способ 2: Escape
             from selenium.webdriver.common.keys import Keys
             self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
             time.sleep(0.5)
@@ -323,7 +289,7 @@ class CISLinkAgent:
     def _parse_error_content(self, text, html):
         """Парсинг содержимого ошибки в структурированный формат"""
         result = {
-            "raw_text": text,
+            "raw_text": text[:2000],  # Ограничиваем длину
             "errors": []
         }
         
@@ -343,22 +309,17 @@ class CISLinkAgent:
             'pdseria': 'справочник серий'
         }
         
+        text_lower = text.lower()
         for pattern, name in file_patterns.items():
-            if pattern in text.lower():
+            if pattern in text_lower:
                 file_type = pattern
                 break
         
         # Извлекаем затронутые поля
         fields = []
-        field_patterns = [
-            r'поля?\s+(\w+)',
-            r'полей?\s+(\w+(?:\s*,\s*\w+)*)',
-            r'значени[ея]\s+(\w+)'
-        ]
-        for pattern in field_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                fields.extend([f.strip() for f in match.split(',')])
+        field_match = re.findall(r'пол[яе]\s+(\w+)', text, re.IGNORECASE)
+        if field_match:
+            fields = field_match
         
         # Подсчет количества ошибок
         count = None
@@ -369,7 +330,7 @@ class CISLinkAgent:
         # Проверяем усечение списка
         is_truncated = "(список неполный)" in text or "и ещё" in text
         
-        # Парсим примеры из таблицы (если есть HTML)
+        # Парсим примеры из таблицы
         examples = []
         if html and '<table' in html.lower():
             examples = self._parse_error_table(html)
@@ -378,10 +339,10 @@ class CISLinkAgent:
             "step": step,
             "file": file_type,
             "fields": list(set(fields)) if fields else None,
-            "message": text[:500],  # Ограничиваем длину
+            "message": text[:500],
             "count": count,
             "is_truncated": is_truncated,
-            "examples": examples[:5] if examples else None  # Максимум 5 примеров
+            "examples": examples[:5] if examples else None
         }
         
         result["errors"].append(error_entry)
@@ -393,8 +354,6 @@ class CISLinkAgent:
         examples = []
         
         try:
-            # Простой парсинг таблицы через regex
-            # Ищем строки таблицы
             row_pattern = r'<tr[^>]*>(.*?)</tr>'
             cell_pattern = r'<td[^>]*>(.*?)</td>'
             header_pattern = r'<t[hd][^>]*>(.*?)</t[hd]>'
@@ -404,12 +363,10 @@ class CISLinkAgent:
             if len(rows) < 2:
                 return examples
             
-            # Первая строка - заголовки
             headers = re.findall(header_pattern, rows[0], re.IGNORECASE | re.DOTALL)
             headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
             
-            # Остальные строки - данные
-            for row in rows[1:6]:  # Максимум 5 строк
+            for row in rows[1:6]:
                 cells = re.findall(cell_pattern, row, re.IGNORECASE | re.DOTALL)
                 cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
                 
@@ -427,7 +384,7 @@ class CISLinkAgent:
         logger.info("Сбор данных из таблицы...")
         
         reports = []
-        rows_with_errors = []  # Индексы строк с ошибками
+        rows_with_errors = []
         
         # Первый проход: собираем основные данные
         rows = self.get_table_rows()
@@ -438,12 +395,11 @@ class CISLinkAgent:
                 if len(cells) < 12:
                     continue
                 
-                # Определяем статус
                 status_text = cells[1].text.strip()
                 is_success = "Удачная" in status_text
-                has_error_link = "Error" in row.text or "lnkView" in row.get_attribute("innerHTML")
+                row_html = row.get_attribute("innerHTML")
+                has_error_link = "Error" in row.text or "lnkView" in row_html
                 
-                # Запоминаем индексы строк с ошибками для второго прохода
                 if not is_success and has_error_link:
                     rows_with_errors.append(idx)
                 
@@ -461,7 +417,7 @@ class CISLinkAgent:
                     "stock_period": cells[10].text.strip() or None,
                     "connection_type": cells[11].text.strip() if len(cells) > 11 else "API",
                     "errors": None,
-                    "_row_index": idx  # Сохраняем индекс для второго прохода
+                    "_row_index": idx
                 }
                 
                 reports.append(report)
@@ -473,23 +429,25 @@ class CISLinkAgent:
                 logger.warning(f"Ошибка обработки строки {idx}: {e}")
                 continue
         
-        logger.info(f"Собрано {len(reports)} записей, с ошибками: {len(rows_with_errors)}")
+        logger.info(f"Собрано {len(reports)} записей, строк с ошибками: {len(rows_with_errors)}")
         
         # Второй проход: парсим детали ошибок
         errors_parsed = 0
         for report in reports:
-            if report["_row_index"] in rows_with_errors:
-                logger.info(f"Парсим ошибку для дистрибьютора {report['distr_name']}...")
-                error_details = self.parse_error_details_for_row(report["_row_index"])
+            row_idx = report["_row_index"]
+            if row_idx in rows_with_errors:
+                logger.info(f"Парсим ошибку для дистрибьютора {report['distr_name']} (строка {row_idx})...")
+                error_details = self.parse_error_details_for_row(row_idx)
                 if error_details:
                     report["errors"] = error_details
                     errors_parsed += 1
                     logger.info(f"Успешно спарсили детали ошибки")
+                else:
+                    logger.warning(f"Не удалось получить детали ошибки")
             
-            # Удаляем служебное поле
             del report["_row_index"]
         
-        logger.info(f"Всего записей: {len(reports)}, с ошибками: {len(rows_with_errors)}, с деталями: {errors_parsed}")
+        logger.info(f"Итого: записей={len(reports)}, с ошибками={len(rows_with_errors)}, с деталями={errors_parsed}")
         
         return reports
     
@@ -527,7 +485,7 @@ class CISLinkAgent:
     def run(self):
         """Основной метод запуска агента"""
         logger.info("=" * 50)
-        logger.info("Агент CISLink v2.1 (с исправленным парсингом ошибок)")
+        logger.info("Агент CISLink v2.2 (с парсингом ошибок)")
         logger.info("=" * 50)
         
         try:
