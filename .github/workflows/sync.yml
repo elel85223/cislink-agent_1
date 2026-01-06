@@ -1,0 +1,38 @@
+name: CISLink Sync Agent
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run CISLink Agent
+        env:
+          CISLINK_LOGIN: ${{ secrets.CISLINK_LOGIN }}
+          CISLINK_PASSWORD: ${{ secrets.CISLINK_PASSWORD }}
+          API_URL: ${{ secrets.API_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+          DEBUG_MODE: 'False'
+        run: python cislink_agent.py
