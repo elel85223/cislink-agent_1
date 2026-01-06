@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 """
-CISLink Agent v2.2 - Синхронизация данных дистрибьюторов
-С исправленным парсингом ошибок и правильными селекторами
+Агент синхронизации CISLink → ЛК PROTECO
+Версия 1.5 - с парсингом детальных ошибок
 """
 
 import os
@@ -9,8 +8,10 @@ import re
 import json
 import time
 import logging
-import requests
 from datetime import datetime
+from typing import Optional, Dict, List, Any
+
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -18,14 +19,13 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
-    TimeoutException, 
+    TimeoutException,
     NoSuchElementException,
     StaleElementReferenceException,
     ElementClickInterceptedException
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -33,484 +33,383 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
-CISLINK_URL = "https://b2b.cislinkdts.com"
-CISLINK_LOGIN = os.environ.get("CISLINK_LOGIN")
-CISLINK_PASSWORD = os.environ.get("CISLINK_PASSWORD")
-API_URL = os.environ.get("API_URL")
-API_KEY = os.environ.get("API_KEY")
+CONFIG = {
+    'cislink_url': 'https://b2b.cislinkdts.com',
+    'cislink_login': os.getenv('CISLINK_LOGIN'),
+    'cislink_password': os.getenv('CISLINK_PASSWORD'),
+    'api_url': os.getenv('API_URL'),
+    'api_key': os.getenv('API_KEY'),
+    'debug_mode': os.getenv('DEBUG_MODE', 'False').lower() == 'true',
+    'timeout': 30,
+    'max_error_text_length': 2000,
+    'max_error_examples': 5
+}
+
+SELECTORS = {
+    'table': 'ctl00_ContentPlaceHolder1_gvUploads',
+    'error_link_template': 'ctl00_ContentPlaceHolder1_gvUploads_ctl{row_id}_lnkView',
+    'error_details': 'ctl00_ContentPlaceHolder1_lblDetails',
+    'close_button_xpath': "//input[@type='button' and @value='Закрыть']"
+}
 
 
-class CISLinkAgent:
-    """Агент для сбора данных из CISLink"""
-    
+class CISLinkScraper:
     def __init__(self):
         self.driver = None
         self.wait = None
-        
-    def setup_browser(self):
-        """Настройка браузера"""
+
+    def init_browser(self):
         logger.info("Инициализация браузера...")
-        
         options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        
+        if not CONFIG['debug_mode']:
+            options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument('--lang=ru-RU')
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-infobars')
+        options.add_argument('--remote-debugging-port=9222')
+
         service = Service(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=service, options=options)
-        self.wait = WebDriverWait(self.driver, 15)
-        
+        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self.wait = WebDriverWait(self.driver, CONFIG['timeout'])
         logger.info("Браузер запущен")
-        
-    def login(self):
-        """Авторизация в CISLink"""
+
+    def login(self) -> bool:
         logger.info("Авторизация в CISLink...")
-        
-        self.driver.get(f"{CISLINK_URL}/Account/Login.aspx")
-        time.sleep(2)
-        
-        # Ввод логина - правильный селектор
-        login_field = self.wait.until(
-            EC.presence_of_element_located((By.ID, "txtLogin"))
-        )
-        login_field.clear()
-        login_field.send_keys(CISLINK_LOGIN)
-        
-        # Ввод пароля - правильный селектор
-        password_field = self.driver.find_element(By.ID, "txtPassword")
-        password_field.clear()
-        password_field.send_keys(CISLINK_PASSWORD)
-        
-        # Клик на кнопку входа - правильный селектор
-        login_button = self.driver.find_element(By.ID, "btnEnter")
-        login_button.click()
-        
-        time.sleep(3)
-        
-        # Проверка успешной авторизации
-        current_url = self.driver.current_url
-        logger.info(f"URL после входа: {current_url}")
-        
-        if "Login" in current_url:
-            raise Exception("Не удалось авторизоваться")
-            
-        logger.info("Авторизация успешна!")
-        
-    def navigate_to_reports(self):
-        """Переход на страницу отчетов"""
-        logger.info("Переход на страницу отчетов...")
-        
-        self.driver.get(f"{CISLINK_URL}/Reports/UploadHistory.aspx")
-        time.sleep(3)
-        
-        # Ждем загрузки таблицы
-        self.wait.until(
-            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_gvUploads"))
-        )
-        
-    def get_table_rows(self):
-        """Получение строк таблицы (свежие элементы)"""
-        table = self.driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_gvUploads")
-        return table.find_elements(By.TAG_NAME, "tr")[1:]  # Пропускаем заголовок
-    
-    def parse_error_details_for_row(self, row_index):
-        """
-        Парсинг деталей ошибки для конкретной строки.
-        Перезагружает страницу и находит строку заново для избежания stale element.
-        """
         try:
-            # Перезагружаем страницу чтобы получить свежие элементы
-            self.driver.get(f"{CISLINK_URL}/Reports/UploadHistory.aspx")
-            time.sleep(2)
-            
-            # Ждем загрузки таблицы
-            self.wait.until(
-                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_gvUploads"))
-            )
-            
-            # Получаем свежие строки
-            rows = self.get_table_rows()
-            if row_index >= len(rows):
-                logger.warning(f"Строка {row_index} не найдена после перезагрузки")
-                return None
-                
-            row = rows[row_index]
-            
-            # Ищем ссылку Error в строке
-            error_link = None
-            
-            # Способ 1: по ID
-            row_num = str(row_index + 2).zfill(2)
-            link_id = f"ctl00_ContentPlaceHolder1_gvUploads_ctl{row_num}_lnkView"
+            self.driver.get(CONFIG['cislink_url'])
+            time.sleep(3)
+            login_field = self.wait.until(EC.presence_of_element_located((By.ID, "txtLogin")))
+            password_field = self.driver.find_element(By.ID, "txtPassword")
+            login_field.clear()
+            time.sleep(0.5)
+            login_field.send_keys(CONFIG['cislink_login'])
+            password_field.clear()
+            time.sleep(0.5)
+            password_field.send_keys(CONFIG['cislink_password'])
+            login_button = self.driver.find_element(By.ID, "btnEnter")
+            login_button.click()
+            time.sleep(5)
+            current_url = self.driver.current_url
+            logger.info(f"URL после входа: {current_url}")
+            if "Default.aspx" in current_url or "Dictionary" in current_url:
+                logger.info("Авторизация успешна!")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка авторизации: {e}")
+            return False
+
+    def navigate_to_reports(self) -> bool:
+        logger.info("Переход на страницу отчетов...")
+        try:
+            self.driver.get(f"{CONFIG['cislink_url']}/Dictionary/Default.aspx")
+            time.sleep(3)
             try:
-                error_link = self.driver.find_element(By.ID, link_id)
-                logger.info(f"Найдена ссылка Error по ID: {link_id}")
+                select_all = self.driver.find_element(By.ID, "cbDistrs")
+                if not select_all.is_selected():
+                    select_all.click()
+                    time.sleep(1)
             except NoSuchElementException:
                 pass
-            
-            # Способ 2: поиск по тексту в строке
+            self.driver.get(f"{CONFIG['cislink_url']}/Reports/UploadHistory.aspx")
+            time.sleep(3)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка навигации: {e}")
+            return False
+
+    def reload_reports_page(self) -> bool:
+        try:
+            self.driver.get(f"{CONFIG['cislink_url']}/Reports/UploadHistory.aspx")
+            time.sleep(3)
+            self.wait.until(EC.presence_of_element_located((By.ID, SELECTORS['table'])))
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка перезагрузки страницы: {e}")
+            return False
+
+    def parse_date(self, date_str: str) -> Optional[str]:
+        if not date_str or date_str.strip() == '':
+            return None
+        try:
+            date_str = date_str.strip()
+            if ' ' in date_str:
+                dt = datetime.strptime(date_str, '%d.%m.%Y %H:%M')
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                dt = datetime.strptime(date_str, '%d.%m.%Y')
+                return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            return None
+
+    def parse_int(self, value: str) -> Optional[int]:
+        if not value or value.strip() == '':
+            return None
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+
+    def parse_error_structure(self, raw_text: str, raw_html: str) -> Dict[str, Any]:
+        result = {
+            'raw_text': raw_text[:CONFIG['max_error_text_length']] if raw_text else '',
+            'errors': []
+        }
+        if not raw_text:
+            return result
+        step_pattern = r'Шаг\s+(\d+):\s*(.+?)(?=\(pd|$)'
+        file_pattern = r'\((pd\w+)(?:\.txt|\.dbf)?\)'
+        step_match = re.search(step_pattern, raw_text)
+        file_matches = re.findall(file_pattern, raw_text)
+        error_info = {
+            'step': f"Шаг {step_match.group(1)}" if step_match else None,
+            'file': file_matches[0] if file_matches else None,
+            'message': step_match.group(2).strip() if step_match else raw_text[:200],
+            'fields': [],
+            'count': 0,
+            'is_truncated': '(список неполный)' in raw_text or '...' in raw_text,
+            'examples': []
+        }
+        if raw_html and '<table' in raw_html:
+            try:
+                headers = re.findall(r'<td[^>]*>([^<]+)</td>', raw_html.split('</tr>')[0] if '</tr>' in raw_html else '')
+                if headers:
+                    error_info['fields'] = [h.strip() for h in headers if h.strip()]
+                rows = raw_html.split('</tr>')[1:]
+                example_count = 0
+                for row in rows:
+                    if example_count >= CONFIG['max_error_examples']:
+                        break
+                    cells = re.findall(r'<td[^>]*>([^<]*)</td>', row)
+                    if cells and len(cells) == len(error_info['fields']):
+                        example = {}
+                        for i, field in enumerate(error_info['fields']):
+                            example[field] = cells[i].strip()
+                        if any(example.values()):
+                            error_info['examples'].append(example)
+                            example_count += 1
+                error_info['count'] = len(rows) - 1
+            except Exception as e:
+                logger.debug(f"Ошибка парсинга таблицы: {e}")
+        result['errors'].append(error_info)
+        return result
+
+    def fetch_error_details(self, row_index: int) -> Optional[Dict[str, Any]]:
+        try:
+            row_id = str(row_index + 2).zfill(2)
+            error_link_id = SELECTORS['error_link_template'].format(row_id=row_id)
+            logger.debug(f"Ищем ссылку Error с ID: {error_link_id}")
+            error_link = None
+            try:
+                error_link = self.driver.find_element(By.ID, error_link_id)
+            except NoSuchElementException:
+                pass
             if not error_link:
                 try:
-                    links = row.find_elements(By.TAG_NAME, "a")
-                    for link in links:
-                        link_id_attr = link.get_attribute("id") or ""
-                        link_text = link.text or ""
-                        if "Error" in link_text or "lnkView" in link_id_attr:
-                            error_link = link
-                            logger.info("Найдена ссылка Error по тексту/атрибуту")
-                            break
-                except:
+                    table = self.driver.find_element(By.ID, SELECTORS['table'])
+                    rows = table.find_elements(By.TAG_NAME, "tr")
+                    if row_index + 1 < len(rows):
+                        row = rows[row_index + 1]
+                        links = row.find_elements(By.TAG_NAME, "a")
+                        for link in links:
+                            if 'lnkView' in (link.get_attribute('id') or ''):
+                                error_link = link
+                                break
+                            if link.text.strip().lower() == 'error':
+                                error_link = link
+                                break
+                except Exception:
                     pass
-            
             if not error_link:
-                logger.warning(f"Ссылка Error не найдена для строки {row_index}")
+                logger.debug(f"Ссылка Error не найдена для строки {row_index}")
                 return None
-            
-            # Кликаем на ссылку Error
-            logger.info("Кликаем на ссылку Error...")
             try:
                 self.driver.execute_script("arguments[0].scrollIntoView(true);", error_link)
                 time.sleep(0.5)
                 error_link.click()
             except ElementClickInterceptedException:
                 self.driver.execute_script("arguments[0].click();", error_link)
-            
-            # Ждем появления popup с деталями
             time.sleep(2)
-            
-            # Ищем элемент с текстом ошибки
-            error_text = ""
-            error_html = ""
-            
-            # Способ 1: по ID lblDetails
             try:
-                element = self.driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_lblDetails")
-                error_text = element.text
-                error_html = element.get_attribute("innerHTML")
-                logger.info(f"Найден текст ошибки по ID lblDetails")
-            except NoSuchElementException:
-                pass
-            
-            # Способ 2: поиск span внутри popup
-            if not error_text:
-                try:
-                    elements = self.driver.find_elements(By.CSS_SELECTOR, "span[id*='lblDetails']")
-                    for el in elements:
-                        text = el.text.strip()
-                        if text and len(text) > 10:
-                            error_text = text
-                            error_html = el.get_attribute("innerHTML")
-                            logger.info("Найден текст ошибки по CSS span[id*='lblDetails']")
-                            break
-                except:
-                    pass
-            
-            # Способ 3: поиск по содержимому
-            if not error_text:
-                try:
-                    xpath = "//*[contains(text(), 'Шаг') and contains(text(), 'найден')]"
-                    elements = self.driver.find_elements(By.XPATH, xpath)
-                    for el in elements:
-                        text = el.text.strip()
-                        if len(text) > 30:
-                            error_text = text
-                            error_html = el.get_attribute("innerHTML")
-                            logger.info("Найден текст ошибки по XPath")
-                            break
-                except:
-                    pass
-            
-            # Способ 4: получить текст из pnlBackGround
-            if not error_text:
-                try:
-                    popup = self.driver.find_element(By.CSS_SELECTOR, ".pnlBackGround")
-                    full_text = popup.text
-                    if "Шаг" in full_text or "найден" in full_text:
-                        error_text = full_text
-                        error_html = popup.get_attribute("innerHTML")
-                        logger.info("Найден текст ошибки в pnlBackGround")
-                except:
-                    pass
-            
-            logger.info(f"Получен текст ошибки ({len(error_text)} символов)")
-            
-            if error_text:
-                logger.info(f"Первые 300 символов: {error_text[:300]}")
-            
-            # Закрываем popup
-            self._close_popup()
-            
-            # Парсим структурированные данные
-            if error_text:
-                return self._parse_error_content(error_text, error_html)
-            
-            return None
-            
+                details_element = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.ID, SELECTORS['error_details']))
+                )
+                raw_text = details_element.text.strip()
+                raw_html = details_element.get_attribute('innerHTML')
+                logger.info(f"Получены детали ошибки для строки {row_index}: {raw_text[:100]}...")
+                self.close_error_popup()
+                return self.parse_error_structure(raw_text, raw_html)
+            except TimeoutException:
+                logger.warning(f"Popup с ошибкой не появился для строки {row_index}")
+                self.close_error_popup()
+                return None
         except Exception as e:
-            logger.error(f"Ошибка при парсинге деталей: {e}")
-            try:
-                self._close_popup()
-            except:
-                pass
+            logger.error(f"Ошибка получения деталей для строки {row_index}: {e}")
+            self.close_error_popup()
             return None
-    
-    def _close_popup(self):
-        """Закрытие popup окна"""
+
+    def close_error_popup(self):
         try:
-            # Способ 1: кнопка Закрыть
-            close_selectors = [
-                "input[value='Закрыть']",
-                "input[value='Close']",
-                "button.close",
-                ".btn-close"
-            ]
-            for sel in close_selectors:
-                try:
-                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
+            close_button = self.driver.find_element(By.XPATH, SELECTORS['close_button_xpath'])
+            close_button.click()
+            time.sleep(1)
+            return
+        except NoSuchElementException:
+            pass
+        try:
+            buttons = self.driver.find_elements(By.TAG_NAME, "input")
+            for btn in buttons:
+                if btn.get_attribute('value') in ['Закрыть', 'Close', 'OK']:
                     btn.click()
-                    time.sleep(0.5)
+                    time.sleep(1)
                     return
-                except:
-                    continue
-            
-            # Способ 2: Escape
+        except Exception:
+            pass
+        try:
             from selenium.webdriver.common.keys import Keys
-            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-            time.sleep(0.5)
-            
-        except Exception as e:
-            logger.warning(f"Не удалось закрыть popup: {e}")
-    
-    def _parse_error_content(self, text, html):
-        """Парсинг содержимого ошибки в структурированный формат"""
-        result = {
-            "raw_text": text[:2000],  # Ограничиваем длину
-            "errors": []
-        }
-        
-        # Извлекаем номер шага
-        step_match = re.search(r'Шаг\s*(\d+)', text)
-        step = step_match.group(0) if step_match else None
-        
-        # Определяем файл с ошибкой
-        file_type = None
-        file_patterns = {
-            'pdrest': 'остатков',
-            'pdfact': 'продаж', 
-            'pdcatal': 'справочник товаров',
-            'pdclient': 'справочник клиентов',
-            'pddoc': 'документов',
-            'pdwh': 'справочник складов',
-            'pdseria': 'справочник серий'
-        }
-        
-        text_lower = text.lower()
-        for pattern, name in file_patterns.items():
-            if pattern in text_lower:
-                file_type = pattern
-                break
-        
-        # Извлекаем затронутые поля
-        fields = []
-        field_match = re.findall(r'пол[яе]\s+(\w+)', text, re.IGNORECASE)
-        if field_match:
-            fields = field_match
-        
-        # Подсчет количества ошибок
-        count = None
-        count_match = re.search(r'(\d+)\s*(?:строк|записей|значений)', text)
-        if count_match:
-            count = int(count_match.group(1))
-        
-        # Проверяем усечение списка
-        is_truncated = "(список неполный)" in text or "и ещё" in text
-        
-        # Парсим примеры из таблицы
-        examples = []
-        if html and '<table' in html.lower():
-            examples = self._parse_error_table(html)
-        
-        error_entry = {
-            "step": step,
-            "file": file_type,
-            "fields": list(set(fields)) if fields else None,
-            "message": text[:500],
-            "count": count,
-            "is_truncated": is_truncated,
-            "examples": examples[:5] if examples else None
-        }
-        
-        result["errors"].append(error_entry)
-        
-        return result
-    
-    def _parse_error_table(self, html):
-        """Парсинг таблицы с примерами ошибок из HTML"""
-        examples = []
-        
-        try:
-            row_pattern = r'<tr[^>]*>(.*?)</tr>'
-            cell_pattern = r'<td[^>]*>(.*?)</td>'
-            header_pattern = r'<t[hd][^>]*>(.*?)</t[hd]>'
-            
-            rows = re.findall(row_pattern, html, re.IGNORECASE | re.DOTALL)
-            
-            if len(rows) < 2:
-                return examples
-            
-            headers = re.findall(header_pattern, rows[0], re.IGNORECASE | re.DOTALL)
-            headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
-            
-            for row in rows[1:6]:
-                cells = re.findall(cell_pattern, row, re.IGNORECASE | re.DOTALL)
-                cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-                
-                if cells and len(cells) == len(headers):
-                    example = dict(zip(headers, cells))
-                    examples.append(example)
-                    
-        except Exception as e:
-            logger.warning(f"Ошибка парсинга таблицы: {e}")
-        
-        return examples
-    
-    def scrape_reports(self):
-        """Сбор данных из таблицы отчетов"""
+            self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            time.sleep(1)
+        except Exception:
+            pass
+
+    def scrape_reports(self) -> list:
         logger.info("Сбор данных из таблицы...")
-        
         reports = []
-        rows_with_errors = []
-        
-        # Первый проход: собираем основные данные
-        rows = self.get_table_rows()
-        
-        for idx, row in enumerate(rows):
-            try:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 12:
-                    continue
-                
-                status_text = cells[1].text.strip()
-                is_success = "Удачная" in status_text
-                row_html = row.get_attribute("innerHTML")
-                has_error_link = "Error" in row.text or "lnkView" in row_html
-                
-                if not is_success and has_error_link:
-                    rows_with_errors.append(idx)
-                
-                report = {
-                    "upload_datetime": cells[0].text.strip(),
-                    "upload_status": "success" if is_success else "error",
-                    "error_file_type": cells[2].text.strip() if not is_success else None,
-                    "distr_code": cells[3].text.strip(),
-                    "distr_id": cells[4].text.strip(),
-                    "distr_name": cells[5].text.strip(),
-                    "city": cells[6].text.strip(),
-                    "doc_max_date": cells[7].text.strip() or None,
-                    "doc_period": cells[8].text.strip() or None,
-                    "stock_max_date": cells[9].text.strip() or None,
-                    "stock_period": cells[10].text.strip() or None,
-                    "connection_type": cells[11].text.strip() if len(cells) > 11 else "API",
-                    "errors": None,
-                    "_row_index": idx
-                }
-                
-                reports.append(report)
-                
-            except StaleElementReferenceException:
-                logger.warning(f"Stale element на строке {idx}, пропускаем")
-                continue
-            except Exception as e:
-                logger.warning(f"Ошибка обработки строки {idx}: {e}")
-                continue
-        
-        logger.info(f"Собрано {len(reports)} записей, строк с ошибками: {len(rows_with_errors)}")
-        
-        # Второй проход: парсим детали ошибок
-        errors_parsed = 0
-        for report in reports:
-            row_idx = report["_row_index"]
-            if row_idx in rows_with_errors:
-                logger.info(f"Парсим ошибку для дистрибьютора {report['distr_name']} (строка {row_idx})...")
-                error_details = self.parse_error_details_for_row(row_idx)
-                if error_details:
-                    report["errors"] = error_details
-                    errors_parsed += 1
-                    logger.info(f"Успешно спарсили детали ошибки")
-                else:
-                    logger.warning(f"Не удалось получить детали ошибки")
-            
-            del report["_row_index"]
-        
-        logger.info(f"Итого: записей={len(reports)}, с ошибками={len(rows_with_errors)}, с деталями={errors_parsed}")
-        
-        return reports
-    
-    def send_to_api(self, reports):
-        """Отправка данных в API"""
-        if not reports:
-            logger.warning("Нет данных для отправки")
-            return False
-        
+        error_rows = []
         try:
-            response = requests.post(
-                API_URL,
-                json={"reports": reports},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": API_KEY
-                },
-                timeout=30
-            )
-            
-            result = response.json()
-            logger.info(f"Результат отправки: {result}")
-            
-            return result.get("success", False)
-            
+            time.sleep(2)
+            try:
+                main_table = self.driver.find_element(By.ID, SELECTORS['table'])
+            except NoSuchElementException:
+                tables = self.driver.find_elements(By.TAG_NAME, "table")
+                main_table = max(tables, key=lambda t: len(t.find_elements(By.TAG_NAME, "tr")), default=None)
+            if not main_table:
+                logger.error("Таблица отчётов не найдена")
+                return []
+            rows = main_table.find_elements(By.TAG_NAME, "tr")[1:]
+            logger.info(f"Найдено {len(rows)} строк в таблице")
+            for row_index, row in enumerate(rows):
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if len(cells) < 10:
+                        continue
+                    upload_status_text = cells[1].text.strip().lower()
+                    is_error = 'неудачн' in upload_status_text
+                    upload_status = 'error' if is_error else ('success' if 'удачн' in upload_status_text else 'error')
+                    stock_max_date = self.parse_date(cells[9].text)
+                    distr_id = self.parse_int(cells[4].text)
+                    if distr_id:
+                        report = {
+                            'distr_id': distr_id,
+                            'distr_code': cells[3].text.strip(),
+                            'distr_name': cells[5].text.strip(),
+                            'city': cells[6].text.strip(),
+                            'upload_datetime': self.parse_date(cells[0].text),
+                            'upload_status': 'error' if upload_status == 'success' and not stock_max_date else upload_status,
+                            'connection_type': cells[11].text.strip() if len(cells) > 11 else '',
+                            'error_file_type': cells[2].text.strip() if upload_status == 'error' else '',
+                            'doc_max_date': self.parse_date(cells[7].text),
+                            'doc_period': self.parse_int(cells[8].text),
+                            'stock_max_date': stock_max_date,
+                            'stock_period': self.parse_int(cells[10].text) if len(cells) > 10 else None,
+                            'errors': None
+                        }
+                        reports.append(report)
+                        if is_error:
+                            try:
+                                links = row.find_elements(By.TAG_NAME, "a")
+                                has_error_link = any(
+                                    'lnkView' in (link.get_attribute('id') or '') or
+                                    link.text.strip().lower() == 'error'
+                                    for link in links
+                                )
+                                if has_error_link:
+                                    error_rows.append((len(reports) - 1, row_index))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug(f"Ошибка обработки строки {row_index}: {e}")
+                    continue
+            logger.info(f"Первый проход: собрано {len(reports)} записей, {len(error_rows)} с ошибками")
+            if error_rows:
+                logger.info(f"Второй проход: парсинг {len(error_rows)} ошибок...")
+                for report_index, row_index in error_rows:
+                    try:
+                        if not self.reload_reports_page():
+                            logger.warning(f"Не удалось перезагрузить страницу для строки {row_index}")
+                            continue
+                        error_details = self.fetch_error_details(row_index)
+                        if error_details:
+                            reports[report_index]['errors'] = error_details
+                            logger.info(f"Ошибка для {reports[report_index]['distr_name']}: получена")
+                        else:
+                            logger.debug(f"Детали ошибки не найдены для строки {row_index}")
+                    except Exception as e:
+                        logger.error(f"Ошибка парсинга деталей для строки {row_index}: {e}")
+                        continue
+                logger.info(f"Второй проход завершён")
+            logger.info(f"Всего собрано {len(reports)} записей")
         except Exception as e:
-            logger.error(f"Ошибка отправки в API: {e}")
-            return False
-    
+            logger.error(f"Ошибка сбора данных: {e}")
+        return reports
+
     def close(self):
-        """Закрытие браузера"""
         if self.driver:
             self.driver.quit()
-    
-    def run(self):
-        """Основной метод запуска агента"""
-        logger.info("=" * 50)
-        logger.info("Агент CISLink v2.2 (с парсингом ошибок)")
-        logger.info("=" * 50)
-        
+
+
+class APIClient:
+    def __init__(self):
+        self.url = CONFIG['api_url']
+        self.api_key = CONFIG['api_key']
+
+    def send_reports(self, reports: list) -> dict:
         try:
-            self.setup_browser()
-            self.login()
-            self.navigate_to_reports()
-            
-            reports = self.scrape_reports()
-            
-            if reports:
-                success = self.send_to_api(reports)
-                if success:
-                    logger.info("Синхронизация завершена успешно")
-                else:
-                    logger.error("Ошибка при отправке данных")
-            else:
-                logger.warning("Не удалось собрать данные")
-                
+            response = requests.post(
+                self.url,
+                json={'api_key': self.api_key, 'reports': reports},
+                timeout=60
+            )
+            return response.json()
         except Exception as e:
-            logger.error(f"Критическая ошибка: {e}")
-            raise
-        finally:
-            self.close()
+            return {'success': False, 'error': str(e)}
 
 
-if __name__ == "__main__":
-    agent = CISLinkAgent()
-    agent.run()
+def main():
+    logger.info("Агент CISLink v1.5 (с парсингом ошибок)")
+    if not all([CONFIG['cislink_login'], CONFIG['cislink_password'], CONFIG['api_url'], CONFIG['api_key']]):
+        logger.error("Не заданы переменные окружения!")
+        exit(1)
+    scraper = CISLinkScraper()
+    try:
+        scraper.init_browser()
+        if not scraper.login():
+            logger.error("Авторизация не удалась")
+            exit(1)
+        if not scraper.navigate_to_reports():
+            logger.error("Навигация не удалась")
+            exit(1)
+        reports = scraper.scrape_reports()
+        if reports:
+            with_errors = sum(1 for r in reports if r.get('errors'))
+            logger.info(f"Отчётов с детальными ошибками: {with_errors}")
+            result = APIClient().send_reports(reports)
+            logger.info(f"Результат отправки: {result}")
+            if not result.get('success'):
+                exit(1)
+        else:
+            logger.warning("Нет данных для отправки")
+    finally:
+        scraper.close()
+
+
+if __name__ == '__main__':
+    main()
