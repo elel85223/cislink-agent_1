@@ -1,6 +1,6 @@
 """
 Агент синхронизации CISLink → ЛК PROTECO
-Версия 1.5 - с парсингом детальных ошибок
+Версия 1.6 - исправлена логика upload_status для дистрибьюторов без остатков
 """
 
 import os
@@ -303,7 +303,8 @@ class CISLinkScraper:
                         continue
                     upload_status_text = cells[1].text.strip().lower()
                     is_error = 'неудачн' in upload_status_text
-                    upload_status = 'error' if is_error else ('success' if 'удачн' in upload_status_text else 'error')
+                    is_success = 'удачн' in upload_status_text and not is_error
+                    upload_status = 'success' if is_success else 'error'
                     stock_max_date = self.parse_date(cells[9].text)
                     distr_id = self.parse_int(cells[4].text)
                     if distr_id:
@@ -313,9 +314,9 @@ class CISLinkScraper:
                             'distr_name': cells[5].text.strip(),
                             'city': cells[6].text.strip(),
                             'upload_datetime': self.parse_date(cells[0].text),
-                            'upload_status': 'error' if upload_status == 'success' and not stock_max_date else upload_status,
+                            'upload_status': upload_status,
                             'connection_type': cells[11].text.strip() if len(cells) > 11 else '',
-                            'error_file_type': cells[2].text.strip() if upload_status == 'error' else '',
+                            'error_file_type': cells[2].text.strip() if is_error else '',
                             'doc_max_date': self.parse_date(cells[7].text),
                             'doc_period': self.parse_int(cells[8].text),
                             'stock_max_date': stock_max_date,
@@ -384,7 +385,7 @@ class APIClient:
 
 
 def main():
-    logger.info("Агент CISLink v1.5 (с парсингом ошибок)")
+    logger.info("Агент CISLink v1.6 (fix upload_status для дистрибьюторов без остатков)")
     if not all([CONFIG['cislink_login'], CONFIG['cislink_password'], CONFIG['api_url'], CONFIG['api_key']]):
         logger.error("Не заданы переменные окружения!")
         exit(1)
