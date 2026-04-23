@@ -495,9 +495,6 @@ def main():
             exit(1)
         linker.run_linking()
         summarize(linker.results)
-        if linker.results:
-            api_resp = APIClient().send_results(linker.results)
-            logger.info(f"Ответ API: {api_resp}")
     finally:
         linker.close()
 
