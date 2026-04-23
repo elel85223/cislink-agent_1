@@ -292,15 +292,27 @@ class CISLinkLinker:
                 result['message'] = f"Поле #{SELECTORS['card_article_input']} не найдено на карточке"
                 return result
 
-            article_input.clear()
-            time.sleep(0.3)
-            article_input.send_keys(item['article'])
-            time.sleep(0.5)
-
-            # Триггерим blur через JS - именно это запускает enter_code(this, event, true)
-            self.driver.execute_script(
-                f"document.getElementById('{SELECTORS['card_article_input']}').blur();"
+            # Устанавливаем значение через JS (обходит проверку интерактивности Selenium)
+            # и явно триггерим события input/change/blur, чтобы сработал enter_code.
+            set_value_script = """
+                var el = document.getElementById(arguments[0]);
+                if (!el) return false;
+                el.focus();
+                el.value = arguments[1];
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+                return true;
+            """
+            ok = self.driver.execute_script(
+                set_value_script,
+                SELECTORS['card_article_input'],
+                item['article']
             )
+            if not ok:
+                result['status'] = 'error'
+                result['message'] = f"Не удалось установить значение в #{SELECTORS['card_article_input']}"
+                return result
             time.sleep(CONFIG['validation_wait_seconds'])
 
             # Проверка ошибки валидации
@@ -437,7 +449,7 @@ class APIClient:
                 'api_key': self.api_key,
                 'source': 'link_products_agent',
                 'run_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'results': results,
+                'reports': results,
             }
             response = requests.post(self.url, json=payload, timeout=60)
             try:
